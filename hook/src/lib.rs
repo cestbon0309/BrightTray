@@ -70,20 +70,96 @@ const SLOT_SET_VALUE: usize = 14;
 const SLOT_ADD_HANDLER: usize = 18;
 const SLOT_REMOVE_HANDLER: usize = 19;
 
-// IQuickAction vtable slots (IInspectable occupies 0..=5). Confirmed against the public PDB
-// symbols of QuickActionsDataModel.dll: get_Id=7, get_FriendlyName=8, get_IsApplicable=9,
-// get_IsEnabled=10, get_QuickActionStatus=12, get_QuickActionIsActive=14,
-// add/remove_QuickActionPropertyChanged=19/20, GetValue=21, SetValue=22.
-const QA_SLOT_GET_ID: usize = 7;
-const QA_SLOT_GET_FRIENDLY_NAME: usize = 8;
-const QA_SLOT_IS_APPLICABLE: usize = 9;
-const QA_SLOT_IS_ENABLED: usize = 10;
-const QA_SLOT_STATUS: usize = 12;
-const QA_SLOT_IS_ACTIVE: usize = 14;
-const QA_SLOT_ADD_HANDLER: usize = 19;
-const QA_SLOT_REMOVE_HANDLER: usize = 20;
-const QA_SLOT_GET_VALUE: usize = 21;
-const QA_SLOT_SET_VALUE: usize = 22;
+// IQuickAction / IQuickActionsProvider vtable slots differ between Windows 10 and Windows 11.
+// Confirmed against the public PDB symbols of QuickActionsDataModel.dll:
+// - Windows 11 (22000+): provider.GetQuickActionByFriendlyName=13, get_Id=7, get_FriendlyName=8,
+//   get_IsApplicable=9, get_IsEnabled=10, get_QuickActionStatus=12, get_QuickActionIsActive=14,
+//   add/remove_QuickActionPropertyChanged=19/20, GetValue=21, SetValue=22.
+// - Windows 10 (18362..21999): provider.GetQuickActionByFriendlyName=22, get_Id=7,
+//   get_FriendlyName=8, get_CustomTemplateKey=9, get_IsApplicable=10, get_IsEnabled=11,
+//   get_QuickActionStatus=13, get_QuickActionIsActive=15,
+//   add/remove_QuickActionPropertyChanged=21/22, GetValue=23, SetValue=24.
+struct QuickActionSlots {
+    provider_get_by_name: usize,
+    get_id: usize,
+    get_friendly_name: usize,
+    is_applicable: usize,
+    is_enabled: usize,
+    status: usize,
+    is_active: usize,
+    add_handler: usize,
+    remove_handler: usize,
+    get_value: usize,
+    set_value: usize,
+}
+
+const WIN11_QA_SLOTS: QuickActionSlots = QuickActionSlots {
+    provider_get_by_name: 13,
+    get_id: 7,
+    get_friendly_name: 8,
+    is_applicable: 9,
+    is_enabled: 10,
+    status: 12,
+    is_active: 14,
+    add_handler: 19,
+    remove_handler: 20,
+    get_value: 21,
+    set_value: 22,
+};
+
+const WIN10_QA_SLOTS: QuickActionSlots = QuickActionSlots {
+    provider_get_by_name: 22,
+    get_id: 7,
+    get_friendly_name: 8,
+    is_applicable: 10,
+    is_enabled: 11,
+    status: 13,
+    is_active: 15,
+    add_handler: 21,
+    remove_handler: 22,
+    get_value: 23,
+    set_value: 24,
+};
+
+#[repr(C)]
+struct OsVersionInfoW {
+    size: u32,
+    major: u32,
+    minor: u32,
+    build: u32,
+    platform_id: u32,
+    csd_version: [u16; 128],
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+}
+
+fn windows_build() -> u32 {
+    let mut info = OsVersionInfoW {
+        size: std::mem::size_of::<OsVersionInfoW>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform_id: 0,
+        csd_version: [0; 128],
+    };
+    if unsafe { RtlGetVersion(&mut info) } == 0 {
+        info.build
+    } else {
+        0
+    }
+}
+
+fn quick_action_slots() -> (u32, &'static QuickActionSlots) {
+    let build = windows_build();
+    if build > 0 && build < 22000 {
+        (build, &WIN10_QA_SLOTS)
+    } else {
+        (build, &WIN11_QA_SLOTS)
+    }
+}
 
 const SETTING_ID: &str = "SystemSettings_Display_Brightness";
 const QUICK_ACTION_NAME: &str = "Microsoft.QuickAction.Brightness";
@@ -278,7 +354,10 @@ unsafe fn read_percent(value: *mut c_void) -> Option<i32> {
     if let Ok(v) = property.GetUInt32() {
         return Some(v as i32);
     }
-    property.GetSingle().ok().map(|v| v.round() as i32)
+    if let Ok(v) = property.GetSingle() {
+        return Some(v.round() as i32);
+    }
+    property.GetDouble().ok().map(|v| v.round() as i32)
 }
 
 unsafe extern "system" fn hooked_is_enabled(_this: *mut c_void, out: *mut u8) -> HRESULT {
@@ -847,6 +926,7 @@ fn in_module(pointer: usize, base: usize, size: usize) -> bool {
 /// patches the shared IQuickAction vtable. ControlCenter binds to this object, so this is the
 /// hook that actually makes the brightness slider appear.
 unsafe fn try_install_quick_actions() -> Result<(), String> {
+    let (build, slots) = quick_action_slots();
     let module = match GetModuleHandleW(w!("QuickActionsDataModel.dll")) {
         Ok(module) if !module.0.is_null() => module,
         _ => LoadLibraryW(w!("QuickActionsDataModel.dll"))
@@ -870,8 +950,8 @@ unsafe fn try_install_quick_actions() -> Result<(), String> {
             provider_vtable as usize
         ));
     }
-    // slot 13 = GetQuickActionByFriendlyName
-    let get_by_name: GetActionByNameFn = std::mem::transmute(*provider_vtable.add(13));
+    let get_by_name: GetActionByNameFn =
+        std::mem::transmute(*provider_vtable.add(slots.provider_get_by_name));
     if !in_module(get_by_name as usize, base, size) {
         return Err("GetQuickActionByFriendlyName slot is outside the module".to_string());
     }
@@ -895,16 +975,16 @@ unsafe fn try_install_quick_actions() -> Result<(), String> {
         ));
     }
     for slot in [
-        QA_SLOT_GET_ID,
-        QA_SLOT_GET_FRIENDLY_NAME,
-        QA_SLOT_IS_APPLICABLE,
-        QA_SLOT_IS_ENABLED,
-        QA_SLOT_STATUS,
-        QA_SLOT_IS_ACTIVE,
-        QA_SLOT_ADD_HANDLER,
-        QA_SLOT_REMOVE_HANDLER,
-        QA_SLOT_GET_VALUE,
-        QA_SLOT_SET_VALUE,
+        slots.get_id,
+        slots.get_friendly_name,
+        slots.is_applicable,
+        slots.is_enabled,
+        slots.status,
+        slots.is_active,
+        slots.add_handler,
+        slots.remove_handler,
+        slots.get_value,
+        slots.set_value,
     ] {
         let pointer = *vtable.add(slot);
         if !in_module(pointer, base, size) {
@@ -915,7 +995,7 @@ unsafe fn try_install_quick_actions() -> Result<(), String> {
         }
     }
 
-    let get_id: GetIdFn = std::mem::transmute(*vtable.add(QA_SLOT_GET_ID));
+    let get_id: GetIdFn = std::mem::transmute(*vtable.add(slots.get_id));
     let mut returned_id: *mut c_void = std::ptr::null_mut();
     let hr = get_id(action, &mut returned_id);
     if hr.is_err() || returned_id.is_null() {
@@ -928,7 +1008,7 @@ unsafe fn try_install_quick_actions() -> Result<(), String> {
         return Err(format!("unexpected quick action id {returned_id_text:?}"));
     }
 
-    let get_friendly: GetIdFn = std::mem::transmute(*vtable.add(QA_SLOT_GET_FRIENDLY_NAME));
+    let get_friendly: GetIdFn = std::mem::transmute(*vtable.add(slots.get_friendly_name));
     let mut returned_friendly: *mut c_void = std::ptr::null_mut();
     let hr = get_friendly(action, &mut returned_friendly);
     if hr.is_ok() && !returned_friendly.is_null() {
@@ -944,28 +1024,28 @@ unsafe fn try_install_quick_actions() -> Result<(), String> {
 
     if QUICK_STATE.get().is_none() {
         let state = QuickState {
-            original_get_id: std::mem::transmute::<usize, GetIdFn>(*vtable.add(QA_SLOT_GET_ID)),
+            original_get_id: std::mem::transmute::<usize, GetIdFn>(*vtable.add(slots.get_id)),
             original_is_applicable: std::mem::transmute::<usize, GetBoolFn>(
-                *vtable.add(QA_SLOT_IS_APPLICABLE),
+                *vtable.add(slots.is_applicable),
             ),
             original_is_enabled: std::mem::transmute::<usize, GetBoolFn>(
-                *vtable.add(QA_SLOT_IS_ENABLED),
+                *vtable.add(slots.is_enabled),
             ),
-            original_status: std::mem::transmute::<usize, GetIdFn>(*vtable.add(QA_SLOT_STATUS)),
+            original_status: std::mem::transmute::<usize, GetIdFn>(*vtable.add(slots.status)),
             original_is_active: std::mem::transmute::<usize, GetBoolFn>(
-                *vtable.add(QA_SLOT_IS_ACTIVE),
+                *vtable.add(slots.is_active),
             ),
             original_get_value: std::mem::transmute::<usize, GetValueFn>(
-                *vtable.add(QA_SLOT_GET_VALUE),
+                *vtable.add(slots.get_value),
             ),
             original_set_value: std::mem::transmute::<usize, SetValueFn>(
-                *vtable.add(QA_SLOT_SET_VALUE),
+                *vtable.add(slots.set_value),
             ),
             original_add_handler: std::mem::transmute::<usize, AddHandlerFn>(
-                *vtable.add(QA_SLOT_ADD_HANDLER),
+                *vtable.add(slots.add_handler),
             ),
             original_remove_handler: std::mem::transmute::<usize, RemoveHandlerFn>(
-                *vtable.add(QA_SLOT_REMOVE_HANDLER),
+                *vtable.add(slots.remove_handler),
             ),
             handlers: Mutex::new(Vec::new()),
         };
@@ -976,23 +1056,23 @@ unsafe fn try_install_quick_actions() -> Result<(), String> {
         vtable,
         &[
             (
-                QA_SLOT_IS_APPLICABLE,
+                slots.is_applicable,
                 quick_is_applicable as *const () as usize,
             ),
-            (QA_SLOT_IS_ENABLED, quick_is_enabled as *const () as usize),
-            (QA_SLOT_STATUS, quick_status as *const () as usize),
-            (QA_SLOT_IS_ACTIVE, quick_is_active as *const () as usize),
-            (QA_SLOT_ADD_HANDLER, quick_add_handler as *const () as usize),
+            (slots.is_enabled, quick_is_enabled as *const () as usize),
+            (slots.status, quick_status as *const () as usize),
+            (slots.is_active, quick_is_active as *const () as usize),
+            (slots.add_handler, quick_add_handler as *const () as usize),
             (
-                QA_SLOT_REMOVE_HANDLER,
+                slots.remove_handler,
                 quick_remove_handler as *const () as usize,
             ),
-            (QA_SLOT_GET_VALUE, quick_get_value as *const () as usize),
-            (QA_SLOT_SET_VALUE, quick_set_value as *const () as usize),
+            (slots.get_value, quick_get_value as *const () as usize),
+            (slots.set_value, quick_set_value as *const () as usize),
         ],
     )?;
     log(format!(
-        "IQuickAction hook installed: vtable=0x{:X} action=0x{:X}",
+        "IQuickAction hook installed (build {build}): vtable=0x{:X} action=0x{:X}",
         vtable as usize, action as usize
     ));
     Ok(())
@@ -1110,7 +1190,14 @@ fn install() {
             CACHED_PERCENT.store(percent, Ordering::Relaxed);
         }
 
-        let mut settings_done = false;
+        let mut settings_done = {
+            let build = windows_build();
+            // Windows 10 hosts Quick Actions inside AppContainer (`ShellExperienceHost.exe`),
+            // where `SettingsHandlers_PCDisplay.dll` (`CWorkerWindowSingleton::s_WindowThread`)
+            // fails CreateWindowExW and triggers a WIL FailFast crash. On Windows 10 the
+            // `IQuickAction` hook alone drives the Action Center brightness slider.
+            build > 0 && build < 22000
+        };
         let mut quick_done = false;
         let mut signalled = false;
         for attempt in 1..=INSTALL_ATTEMPTS {
@@ -1169,7 +1256,6 @@ pub extern "system" fn DllMain(
         // DllMain must stay tiny: do all resolution and patching on a worker thread after the
         // loader lock has been released.
         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(300));
             log("brighttray_hook attached");
             install();
         });

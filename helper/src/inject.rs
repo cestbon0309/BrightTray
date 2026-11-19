@@ -9,8 +9,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use windows::core::{s, w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::FILETIME;
-use windows::Win32::Foundation::{CloseHandle, FALSE, HANDLE, TRUE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, LocalFree, FALSE, FILETIME, HANDLE, HLOCAL, TRUE, WAIT_OBJECT_0,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+    TRUSTEE_W,
+};
+use windows::Win32::Security::{
+    ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
+};
+use windows::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
@@ -45,8 +55,9 @@ fn wide_to_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
-/// PIDs of every running ShellHost.exe.
+/// PIDs of every running target shell host (`ShellHost.exe` on Win11 24H2+, `ShellExperienceHost.exe` on Win10).
 pub fn shellhost_pids() -> Vec<u32> {
+    let target = crate::osver::target_process_name();
     let mut pids = Vec::new();
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
@@ -58,7 +69,7 @@ pub fn shellhost_pids() -> Vec<u32> {
         };
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
-                if wide_to_string(&entry.szExeFile).eq_ignore_ascii_case(SHELLHOST) {
+                if wide_to_string(&entry.szExeFile).eq_ignore_ascii_case(target) {
                     pids.push(entry.th32ProcessID);
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
@@ -197,21 +208,193 @@ unsafe fn inject_inner(process: HANDLE, pid: u32, dll: &Path) -> Result<(), Stri
     result
 }
 
+/// Grants `ALL APPLICATION PACKAGES` (`S-1-15-2-1`) read + execute access on `dll` so
+/// AppContainer processes (`ShellExperienceHost.exe` on Windows 10) can load it.
+pub fn ensure_appcontainer_read(dll: &Path) -> Result<(), String> {
+    if crate::osver::is_win11_shell_host() {
+        return Ok(());
+    }
+    let wide_path: Vec<u16> = dll
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut ac_sid = PSID::default();
+        ConvertStringSidToSidW(w!("S-1-15-2-1"), &mut ac_sid)
+            .map_err(|e| format!("ConvertStringSidToSidW(S-1-15-2-1): {e}"))?;
+
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let err = GetNamedSecurityInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old_dacl),
+            None,
+            &mut sd,
+        );
+        if err.0 != 0 {
+            let _ = LocalFree(HLOCAL(ac_sid.0));
+            return Err(format!(
+                "GetNamedSecurityInfoW({}): {}",
+                dll.display(),
+                err.0
+            ));
+        }
+
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE).0,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: Default::default(),
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                ptstrName: PWSTR(ac_sid.0 as *mut u16),
+            },
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let acl_err = SetEntriesInAclW(Some(&[ea]), Some(old_dacl), &mut new_dacl);
+        let set_err = if acl_err.0 == 0 {
+            SetNamedSecurityInfoW(
+                PCWSTR(wide_path.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(new_dacl),
+                None,
+            )
+        } else {
+            acl_err
+        };
+
+        if !new_dacl.is_null() {
+            let _ = LocalFree(HLOCAL(new_dacl.cast()));
+        }
+        if !sd.0.is_null() {
+            let _ = LocalFree(HLOCAL(sd.0));
+        }
+        let _ = LocalFree(HLOCAL(ac_sid.0));
+
+        if set_err.0 != 0 {
+            return Err(format!(
+                "SetNamedSecurityInfoW({}): {}",
+                dll.display(),
+                set_err.0
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Returns true when every thread of `pid` is in the OS `Waiting`/`Suspended` state
+/// (e.g. Windows 10 PLM freeze on `ShellExperienceHost.exe`), where `CreateRemoteThread`
+/// cannot make progress until the process is resumed.
+fn is_process_suspended(pid: u32) -> bool {
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let _ = pid;
+        return false;
+    }
+    #[cfg(target_pointer_width = "64")]
+    unsafe {
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtQuerySystemInformation(
+                class: u32,
+                info: *mut c_void,
+                len: u32,
+                ret_len: *mut u32,
+            ) -> i32;
+        }
+        const SYSTEM_PROCESS_INFORMATION_CLASS: u32 = 5;
+        const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
+        const PROC_SIZE: usize = 256;
+        const THREAD_SIZE: usize = 80;
+        const STATE_WAITING: u32 = 5;
+        const WAIT_SUSPENDED: u32 = 5;
+
+        let mut size: usize = 512 * 1024;
+        let mut buf: Vec<u8>;
+        loop {
+            buf = vec![0u8; size];
+            let mut ret_len = 0u32;
+            let status = NtQuerySystemInformation(
+                SYSTEM_PROCESS_INFORMATION_CLASS,
+                buf.as_mut_ptr().cast(),
+                size as u32,
+                &mut ret_len,
+            );
+            if status == 0 {
+                break;
+            }
+            if status == STATUS_INFO_LENGTH_MISMATCH {
+                size = (ret_len as usize).saturating_add(65536).max(size * 2);
+                if size > 64 * 1024 * 1024 {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        let mut offset = 0usize;
+        while offset + PROC_SIZE <= buf.len() {
+            let base = buf.as_ptr().add(offset);
+            let next_offset = *(base as *const u32) as usize;
+            let num_threads = *(base.add(4) as *const u32) as usize;
+            let unique_pid = *(base.add(80) as *const usize);
+            if unique_pid == pid as usize {
+                if num_threads == 0 || offset + PROC_SIZE + num_threads * THREAD_SIZE > buf.len() {
+                    return false;
+                }
+                for i in 0..num_threads {
+                    let t = base.add(PROC_SIZE + i * THREAD_SIZE);
+                    let state = *(t.add(68) as *const u32);
+                    let wait_reason = *(t.add(72) as *const u32);
+                    if state != STATE_WAITING || wait_reason != WAIT_SUSPENDED {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if next_offset == 0 {
+                break;
+            }
+            offset += next_offset;
+        }
+        false
+    }
+}
+
 /// Injects into every ShellHost.exe that does not already have the hook. Returns how many
 /// processes were injected into this time.
 pub fn inject_all(dll: &Path) -> Result<usize, String> {
     if !dll.is_file() {
         return Err(format!("hook DLL not found: {}", dll.display()));
     }
+    ensure_appcontainer_read(dll)?;
+    let target = crate::osver::target_process_name();
     let pids = shellhost_pids();
     if pids.is_empty() {
-        return Err(format!("{SHELLHOST} is not running"));
+        return Err(format!("{target} is not running"));
     }
 
     let mut injected = 0;
     let mut errors = Vec::new();
     for pid in pids {
         if module_loaded(pid, HOOK_DLL) {
+            continue;
+        }
+        if !crate::osver::is_win11_shell_host() && is_process_suspended(pid) {
+            errors.push(format!(
+                "{target} (pid {pid}) is suspended by Windows; open Action Center or restart it first"
+            ));
             continue;
         }
         match inject_pid(pid, dll) {
@@ -233,6 +416,9 @@ pub fn inject_all(dll: &Path) -> Result<usize, String> {
 /// `IQuickAction` hook answers every later query; this path exists for builds where Quick
 /// Settings caches the brightness capability before a late hook could take effect.
 pub fn inject_early(dll: &Path) -> Result<u32, String> {
+    if !crate::osver::is_win11_shell_host() {
+        return Err("--early is only supported on Windows 11 (ShellHost.exe); ShellExperienceHost.exe is AppX-activated".to_string());
+    }
     if !dll.is_file() {
         return Err(format!("hook DLL not found: {}", dll.display()));
     }
@@ -356,10 +542,11 @@ pub enum WatchEvent {
 
 impl std::fmt::Display for WatchEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let target = crate::osver::target_process_name();
         match self {
-            WatchEvent::Hooked => write!(f, "hook loaded in ShellHost"),
-            WatchEvent::NoShellHost => write!(f, "{SHELLHOST} is not running"),
-            WatchEvent::Restarting => write!(f, "restarting {SHELLHOST} so the hook loads early"),
+            WatchEvent::Hooked => write!(f, "hook loaded in {target}"),
+            WatchEvent::NoShellHost => write!(f, "{target} is not running"),
+            WatchEvent::Restarting => write!(f, "restarting {target} so the hook loads early"),
             WatchEvent::DllMissing(path) => write!(f, "{} not found", path.display()),
             WatchEvent::Error(message) => f.write_str(message),
         }
@@ -390,18 +577,27 @@ pub fn watch_and_inject(
         let mut hooked: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut last: Option<WatchEvent> = None;
         let mut last_restart: Option<std::time::Instant> = None;
+        let mut acl_ready = false;
 
         loop {
             let pids = shellhost_pids();
             hooked.retain(|pid| pids.contains(pid));
 
             let event = if !dll.is_file() {
+                acl_ready = false;
                 WatchEvent::DllMissing(dll.clone())
             } else if pids.is_empty() {
                 WatchEvent::NoShellHost
             } else {
                 let mut error = None;
                 let mut restarted = false;
+                let mut waiting_thaw = false;
+                if !acl_ready {
+                    match ensure_appcontainer_read(&dll) {
+                        Ok(()) => acl_ready = true,
+                        Err(e) => error = Some(e),
+                    }
+                }
                 for &pid in &pids {
                     if hooked.contains(&pid) {
                         continue;
@@ -410,8 +606,10 @@ pub fn watch_and_inject(
                         hooked.insert(pid);
                         continue;
                     }
+                    let suspended =
+                        !crate::osver::is_win11_shell_host() && is_process_suspended(pid);
                     let stale = restart_stale
-                        && process_age(pid).is_some_and(|age| age > FRESH_SHELLHOST)
+                        && (suspended || process_age(pid).is_some_and(|age| age > FRESH_SHELLHOST))
                         && last_restart.is_none_or(|t| t.elapsed() > RESTART_COOLDOWN);
                     if stale {
                         last_restart = Some(std::time::Instant::now());
@@ -424,6 +622,11 @@ pub fn watch_and_inject(
                             Err(e) => error = Some(e),
                         }
                     }
+                    if suspended {
+                        // Avoid leaking a blocked CreateRemoteThread into a PLM-frozen process.
+                        waiting_thaw = true;
+                        continue;
+                    }
                     match inject_pid(pid, &dll) {
                         Ok(()) => {
                             hooked.insert(pid);
@@ -433,6 +636,8 @@ pub fn watch_and_inject(
                 }
                 if restarted {
                     WatchEvent::Restarting
+                } else if waiting_thaw {
+                    WatchEvent::NoShellHost
                 } else {
                     error.map_or(WatchEvent::Hooked, WatchEvent::Error)
                 }

@@ -18,8 +18,12 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use windows::core::w;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    LocalFree, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
 };
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
@@ -224,6 +228,23 @@ fn create_instance(first: bool) -> std::io::Result<HANDLE> {
     } else {
         PIPE_ACCESS_DUPLEX
     };
+    // Grant SY/BA full access, Interactive Users (IU) and All Application Packages (AC = S-1-15-2-1)
+    // read/write so Win10 AppContainer `ShellExperienceHost.exe` can talk to `\.pipeBrightTray`.
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let has_sd = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)(A;;GRGW;;;AC)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+        .is_ok()
+    };
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
     let handle = unsafe {
         CreateNamedPipeW(
             w!(r"\\.\pipe\BrightTray"),
@@ -233,9 +254,14 @@ fn create_instance(first: bool) -> std::io::Result<HANDLE> {
             4096,
             4096,
             0,
-            None,
+            if has_sd { Some(&sa) } else { None },
         )
     };
+    if has_sd && !sd.0.is_null() {
+        unsafe {
+            let _ = LocalFree(HLOCAL(sd.0));
+        }
+    }
     if handle == INVALID_HANDLE_VALUE {
         let error = std::io::Error::last_os_error();
         if first && error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) {

@@ -173,6 +173,12 @@ pub fn probe() -> Result<(), String> {
                         hr.0 as u32
                     );
                     if hr.is_ok() && !provider.is_null() {
+                        let (provider_slot, app_slot, en_slot) =
+                            if crate::osver::is_win11_quick_actions() {
+                                (13, 9, 10)
+                            } else {
+                                (22, 10, 11)
+                            };
                         let provider_vtable = *(provider as *mut *mut usize);
                         println!("provider vtable = 0x{:X}", provider_vtable as usize);
                         let get_by_name: unsafe extern "system" fn(
@@ -180,13 +186,13 @@ pub fn probe() -> Result<(), String> {
                             *mut c_void,
                             *mut *mut c_void,
                         )
-                            -> HRESULT = std::mem::transmute(*provider_vtable.add(13));
+                            -> HRESULT = std::mem::transmute(*provider_vtable.add(provider_slot));
                         let friendly = HSTRING::from("Microsoft.QuickAction.Brightness");
                         let raw_friendly: *mut c_void = std::mem::transmute_copy(&friendly);
                         let mut action: *mut c_void = std::ptr::null_mut();
                         let hr = get_by_name(provider, raw_friendly, &mut action);
                         println!(
-                            "GetQuickActionByFriendlyName(Brightness) -> 0x{:08X}, action={action:p}",
+                            "GetQuickActionByFriendlyName(Brightness) [slot {provider_slot}] -> 0x{:08X}, action={action:p}",
                             hr.0 as u32
                         );
                         if hr.is_ok() && !action.is_null() {
@@ -196,12 +202,12 @@ pub fn probe() -> Result<(), String> {
                                 *mut c_void,
                                 *mut u8,
                             )
-                                -> HRESULT = std::mem::transmute(*action_vtable.add(9));
+                                -> HRESULT = std::mem::transmute(*action_vtable.add(app_slot));
                             let get_enabled: unsafe extern "system" fn(
                                 *mut c_void,
                                 *mut u8,
                             )
-                                -> HRESULT = std::mem::transmute(*action_vtable.add(10));
+                                -> HRESULT = std::mem::transmute(*action_vtable.add(en_slot));
                             let mut value = 0u8;
                             let hr = get_applicable(action, &mut value);
                             println!(

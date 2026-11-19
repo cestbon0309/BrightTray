@@ -1,11 +1,16 @@
 //! Windows build detection.
 //!
-//! The Quick Settings hook targets `ShellHost.exe`, which only hosts Quick Settings since
-//! Windows 11 24H2 (build 26100). On older builds the panel lives in `ShellExperienceHost.exe`
-//! with a different layout, so the hook must not be attempted there.
+//! On Windows 11 24H2+ (build 26100+), Quick Settings is hosted by `ShellHost.exe`.
+//! On Windows 10 1903+ (build 18362+) through Windows 11 23H2, the Action Center / Quick
+//! Settings panel is hosted by `ShellExperienceHost.exe` with an earlier `IQuickAction`
+//! / `IQuickActionsProvider` vtable layout.
 
 use std::sync::OnceLock;
 
+/// First Windows 10 build with the Action Center brightness slider (1903).
+pub const MIN_WIN10_ACTION_CENTER_BUILD: u32 = 18362;
+/// First Windows 11 build (whose `QuickActionsDataModel.dll` uses the Win11 `IQuickAction` vtable).
+pub const MIN_WIN11_BUILD: u32 = 22000;
 /// First build whose Quick Settings panel is hosted by `ShellHost.exe` (Windows 11 24H2).
 pub const MIN_QUICK_SETTINGS_BUILD: u32 = 26100;
 
@@ -54,9 +59,31 @@ pub fn build() -> u32 {
     *BUILD.get_or_init(detect)
 }
 
-/// Whether the Quick Settings hook can work on this system. An unreadable build number counts
-/// as supported: the hook validates everything it patches and gives up safely on its own.
-pub fn quick_settings_supported() -> bool {
+/// Whether this build uses `ShellHost.exe` (Windows 11 24H2+) rather than `ShellExperienceHost.exe`.
+pub fn is_win11_shell_host() -> bool {
     let build = build();
     build == 0 || build >= MIN_QUICK_SETTINGS_BUILD
+}
+
+/// Whether `QuickActionsDataModel.dll` uses the Windows 11 `IQuickActionsProvider`/`IQuickAction`
+/// vtable slot layout rather than Windows 10's.
+pub fn is_win11_quick_actions() -> bool {
+    let build = build();
+    build == 0 || build >= MIN_WIN11_BUILD
+}
+
+/// Target shell host executable name for the current Windows build.
+pub fn target_process_name() -> &'static str {
+    if is_win11_shell_host() {
+        "ShellHost.exe"
+    } else {
+        "ShellExperienceHost.exe"
+    }
+}
+
+/// Whether the Quick Settings / Action Center hook can work on this system. An unreadable build
+/// number counts as supported: the hook validates everything it patches and gives up safely on its own.
+pub fn quick_settings_supported() -> bool {
+    let build = build();
+    build == 0 || build >= MIN_WIN10_ACTION_CENTER_BUILD
 }

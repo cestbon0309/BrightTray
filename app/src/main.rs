@@ -141,7 +141,8 @@ impl App {
             "os": {
                 "supported": osver::quick_settings_supported(),
                 "build": osver::build(),
-                "min": osver::MIN_QUICK_SETTINGS_BUILD,
+                "min": osver::MIN_WIN10_ACTION_CENTER_BUILD,
+                "target": osver::target_process_name().strip_suffix(".exe").unwrap_or(osver::target_process_name()),
             },
         });
         let _ = self

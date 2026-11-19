@@ -54,11 +54,17 @@ fn main() -> ExitCode {
         }
         return match inject::inject_all(&dll) {
             Ok(0) => {
-                println!("brighttray hook is already loaded in ShellHost");
+                println!(
+                    "brighttray hook is already loaded in {}",
+                    osver::target_process_name()
+                );
                 ExitCode::SUCCESS
             }
             Ok(n) => {
-                println!("injected into {n} ShellHost process(es)");
+                println!(
+                    "injected into {n} {} process(es)",
+                    osver::target_process_name()
+                );
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -83,10 +89,10 @@ fn main() -> ExitCode {
         // across ShellHost restarts. Set BRIGHTTRAY_NO_HOOK=1 to disable that.
         if !osver::quick_settings_supported() {
             eprintln!(
-                "hook watcher: Windows build {} is not supported (needs {}+, Windows 11 24H2); \
+                "hook watcher: Windows build {} is not supported (needs {}+, Windows 10 1903); \
                  serving the pipe without the Quick Settings hook",
                 osver::build(),
-                osver::MIN_QUICK_SETTINGS_BUILD
+                osver::MIN_WIN10_ACTION_CENTER_BUILD
             );
         } else if std::env::var_os("BRIGHTTRAY_NO_HOOK").is_none() {
             match inject::default_dll_path() {
